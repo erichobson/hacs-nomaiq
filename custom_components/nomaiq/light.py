@@ -32,9 +32,19 @@ _INTER_PROPERTY_DELAY_SECONDS = 0.05
 
 _POWER_PROPERTY_CANDIDATES = ("light_control", "light_switch", "power_switch", "power")
 _BRIGHTNESS_PROPERTY_CANDIDATES = ("light_brightness", "brightness")
-_HUE_PROPERTY_CANDIDATES = ("light_hue", "hue")
-_SATURATION_PROPERTY_CANDIDATES = ("light_saturation", "saturation")
-_COLOR_TEMP_PROPERTY_CANDIDATES = ("color_temp", "light_color_temp")
+_HUE_PROPERTY_CANDIDATES = ("light_hue", "hue", "colour_hue", "color_hue")
+_SATURATION_PROPERTY_CANDIDATES = (
+    "light_saturation",
+    "saturation",
+    "colour_saturation",
+    "color_saturation",
+)
+_COLOR_TEMP_PROPERTY_CANDIDATES = (
+    "color_temp",
+    "light_color_temp",
+    "colour_temp",
+    "light_colour_temp",
+)
 
 
 async def async_setup_entry(
@@ -104,10 +114,22 @@ class NomaIQLightEntity(LightEntity):
             identifiers={(DOMAIN, device.serial_number)},
             name=device.name,
         )
-        self._brightness_property = self._find_property(_BRIGHTNESS_PROPERTY_CANDIDATES)
-        self._hue_property = self._find_property(_HUE_PROPERTY_CANDIDATES)
-        self._saturation_property = self._find_property(_SATURATION_PROPERTY_CANDIDATES)
-        self._color_temp_property = self._find_property(_COLOR_TEMP_PROPERTY_CANDIDATES)
+        self._brightness_property = self._find_property(
+            _BRIGHTNESS_PROPERTY_CANDIDATES,
+            fallback_terms=("bright",),
+        )
+        self._hue_property = self._find_property(
+            _HUE_PROPERTY_CANDIDATES,
+            fallback_terms=("hue",),
+        )
+        self._saturation_property = self._find_property(
+            _SATURATION_PROPERTY_CANDIDATES,
+            fallback_terms=("saturation", "_sat"),
+        )
+        self._color_temp_property = self._find_property(
+            _COLOR_TEMP_PROPERTY_CANDIDATES,
+            fallback_terms=("color_temp", "colour_temp", "temperature", "kelvin", "mired"),
+        )
         self._color_temp_uses_mired = self._detect_color_temp_mired_mode()
         self._set_supported_color_modes()
         self._pending_updates: dict[str, int | float] = {}
@@ -158,7 +180,12 @@ class NomaIQLightEntity(LightEntity):
             None,
         )
 
-    def _find_property(self, candidates: tuple[str, ...]) -> str | None:
+    def _find_property(
+        self,
+        candidates: tuple[str, ...],
+        *,
+        fallback_terms: tuple[str, ...] = (),
+    ) -> str | None:
         """Return first known property that exists on this device."""
         properties = getattr(self._device, "properties_full", {})
         if not hasattr(properties, "get"):
@@ -167,6 +194,13 @@ class NomaIQLightEntity(LightEntity):
             prop = properties.get(candidate)
             if isinstance(prop, Mapping) and prop:
                 return candidate
+        if fallback_terms:
+            for property_name, prop in properties.items():
+                if not isinstance(prop, Mapping) or not prop:
+                    continue
+                normalized_name = property_name.lower()
+                if any(term in normalized_name for term in fallback_terms):
+                    return property_name
         return None
 
     def _property_definition(
@@ -196,6 +230,48 @@ class NomaIQLightEntity(LightEntity):
             return device.get_property_value(property_name)
         except (KeyError, TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _normalize_property_name(property_name: str) -> str:
+        """Normalize Ayla GET_/SET_ prefixed property names."""
+        normalized = property_name.lower()
+        if normalized.startswith("set_") or normalized.startswith("get_"):
+            return normalized[4:]
+        return normalized
+
+    def _find_set_property_api_name(self, property_name: str) -> str | None:
+        """Find API property name for writable SET_* aliases."""
+        properties = getattr(self._device, "properties_full", {})
+        if not hasattr(properties, "items"):
+            return None
+        target = self._normalize_property_name(property_name)
+
+        for key, prop in properties.items():
+            if not isinstance(prop, Mapping):
+                continue
+            candidate_name = str(prop.get("name") or key)
+            normalized_candidate = candidate_name.lower()
+            if not normalized_candidate.startswith("set_"):
+                continue
+            if self._normalize_property_name(candidate_name) == target:
+                return candidate_name
+
+        return None
+
+    @staticmethod
+    def _coerce_is_on(value: Any) -> bool:
+        """Convert variable API value types to on/off state reliably."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(int(value))
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"0", "off", "false", "no"}:
+                return False
+            if normalized in {"1", "on", "true", "yes"}:
+                return True
+        return bool(value)
 
     @staticmethod
     def _clamp(value: float, min_value: float, max_value: float) -> float:
@@ -309,7 +385,7 @@ class NomaIQLightEntity(LightEntity):
     def is_on(self) -> bool | None:
         """Return true if light is on."""
         value = self._safe_get_property_value(self._power_property)
-        return bool(value) if value is not None else None
+        return self._coerce_is_on(value) if value is not None else None
 
     @property
     def brightness(self) -> int | None:
@@ -375,7 +451,21 @@ class NomaIQLightEntity(LightEntity):
         prop = self._property_definition(property_name, use_current_device=False)
         if not prop:
             return False
-        return not bool(prop.get("read_only"))
+        if not bool(prop.get("read_only")):
+            return True
+        return self._find_set_property_api_name(property_name) is not None
+
+    def _update_cached_property_value(self, property_name: str, value: int | float) -> None:
+        """Update local and coordinator-cached property values optimistically."""
+        for device in (self._device, self._get_current_device()):
+            if not device:
+                continue
+            properties = getattr(device, "properties_full", None)
+            if not hasattr(properties, "get"):
+                continue
+            local_property = properties.get(property_name)
+            if isinstance(local_property, dict):
+                local_property["value"] = value
 
     async def _safe_async_set_property_value(
         self, property_name: str, value: int | float
@@ -385,10 +475,12 @@ class NomaIQLightEntity(LightEntity):
         if not prop:
             _LOGGER.debug("Skipping unsupported property write: %s", property_name)
             return False
-        if prop.get("read_only"):
-            _LOGGER.debug("Skipping read-only property write: %s", property_name)
-            return False
         api_property_name = prop.get("name")
+        if prop.get("read_only"):
+            api_property_name = self._find_set_property_api_name(property_name)
+            if not api_property_name:
+                _LOGGER.debug("Skipping read-only property write: %s", property_name)
+                return False
         if not api_property_name:
             _LOGGER.debug("Skipping property write without API name: %s", property_name)
             return False
@@ -408,7 +500,7 @@ class NomaIQLightEntity(LightEntity):
             local_property = properties.get(property_name)
             if isinstance(local_property, dict):
                 local_property.update(response_data)
-                local_property["value"] = value
+        self._update_cached_property_value(property_name, value)
         return True
 
     async def _queue_updates(self, updates: dict[str, int | float]) -> None:
@@ -431,13 +523,17 @@ class NomaIQLightEntity(LightEntity):
                     updates = self._pending_updates.copy()
                     self._pending_updates.clear()
 
+                has_state_change = False
                 for index, (property_name, value) in enumerate(updates.items()):
                     if not self._property_is_writable(property_name):
                         continue
                     if self._safe_get_property_value(property_name) == value:
                         continue
                     try:
-                        await self._safe_async_set_property_value(property_name, value)
+                        has_state_change = (
+                            await self._safe_async_set_property_value(property_name, value)
+                            or has_state_change
+                        )
                     except Exception as ex:  # noqa: BLE001
                         _LOGGER.warning(
                             "Failed setting %s for device %s: %s",
@@ -447,6 +543,9 @@ class NomaIQLightEntity(LightEntity):
                         )
                     if index < len(updates) - 1:
                         await asyncio.sleep(_INTER_PROPERTY_DELAY_SECONDS)
+
+                if has_state_change:
+                    self.async_write_ha_state()
 
                 # If more updates were queued while writing, debounce briefly and apply again.
                 async with self._pending_lock:
