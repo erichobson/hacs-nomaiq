@@ -30,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 _DEBOUNCE_SECONDS = 0.25
 _INTER_PROPERTY_DELAY_SECONDS = 0.05
 
+_POWER_PROPERTY_CANDIDATES = ("light_control", "light_switch", "power_switch", "power")
 _BRIGHTNESS_PROPERTY_CANDIDATES = ("light_brightness", "brightness")
 _HUE_PROPERTY_CANDIDATES = ("light_hue", "hue")
 _SATURATION_PROPERTY_CANDIDATES = ("light_saturation", "saturation")
@@ -44,14 +45,40 @@ async def async_setup_entry(
     """Set up the Noma IQ Light platform."""
     coordinator: NomaIQDataUpdateCoordinator = entry.runtime_data
 
+    entities: list[NomaIQLightEntity] = []
     for device in coordinator.data:
-        if (
-            "light_control" in device.properties_full
-            and "light_name" in device.properties_full
-        ):
-            async_add_entities(
-                [NomaIQLightEntity(coordinator, device)], update_before_add=False
+        device_properties = getattr(device, "properties_full", {})
+        if not hasattr(device_properties, "get"):
+            _LOGGER.debug("Skipping device %s: no readable property map", device.serial_number)
+            continue
+
+        power_property = next(
+            (
+                candidate
+                for candidate in _POWER_PROPERTY_CANDIDATES
+                if isinstance(device_properties.get(candidate), Mapping)
+            ),
+            None,
+        )
+        if not power_property:
+            _LOGGER.debug(
+                "Skipping device %s: no supported power property found (available: %s)",
+                device.serial_number,
+                sorted(device_properties.keys()),
             )
+            continue
+
+        entities.append(NomaIQLightEntity(coordinator, device, power_property))
+
+    if entities:
+        async_add_entities(entities, update_before_add=False)
+        _LOGGER.debug("Added %d NomaIQ light entities", len(entities))
+    else:
+        _LOGGER.warning(
+            "No NomaIQ light entities discovered. Check that the bulb exposes a supported "
+            "power property (%s).",
+            ", ".join(_POWER_PROPERTY_CANDIDATES),
+        )
 
 
 class NomaIQLightEntity(LightEntity):
@@ -61,15 +88,18 @@ class NomaIQLightEntity(LightEntity):
         self,
         coordinator: NomaIQDataUpdateCoordinator,
         device: ayla_iot_unofficial.device.Device,
+        power_property: str,
     ) -> None:
         """Initialize a NomaIQ light."""
         self.coordinator = coordinator
         self._device = device
+        self._power_property = power_property
         self._attr_supported_color_modes = {ColorMode.ONOFF}
         self._attr_color_mode = ColorMode.ONOFF
-        self._attr_name = device.get_property_value("light_name") or device.name
+        light_name = self._safe_get_property_value("light_name")
+        self._attr_name = light_name or device.name
         self._attr_unique_id = f"nomaiq_light_{device.serial_number}"
-        self._attr_has_entity_name = device.get_property_value("light_name")
+        self._attr_has_entity_name = bool(light_name)
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, device.serial_number)},
             name=device.name,
@@ -278,7 +308,7 @@ class NomaIQLightEntity(LightEntity):
     @property
     def is_on(self) -> bool | None:
         """Return true if light is on."""
-        value = self._safe_get_property_value("light_control")
+        value = self._safe_get_property_value(self._power_property)
         return bool(value) if value is not None else None
 
     @property
@@ -433,7 +463,7 @@ class NomaIQLightEntity(LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn device on."""
-        updates: dict[str, int | float] = {"light_control": 1}
+        updates: dict[str, int | float] = {self._power_property: 1}
 
         if self._brightness_property and ATTR_BRIGHTNESS in kwargs:
             updates[self._brightness_property] = self._ha_brightness_to_device(
@@ -491,7 +521,7 @@ class NomaIQLightEntity(LightEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn device off."""
-        await self._queue_updates({"light_control": 0})
+        await self._queue_updates({self._power_property: 0})
 
     async def async_update(self) -> None:
         """Update the light state."""
