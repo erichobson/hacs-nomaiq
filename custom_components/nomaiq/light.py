@@ -32,12 +32,19 @@ _INTER_PROPERTY_DELAY_SECONDS = 0.05
 
 _POWER_PROPERTY_CANDIDATES = ("light_control", "light_switch", "power_switch", "power")
 _BRIGHTNESS_PROPERTY_CANDIDATES = ("light_brightness", "brightness")
-_HUE_PROPERTY_CANDIDATES = ("light_hue", "hue", "colour_hue", "color_hue")
+_HUE_PROPERTY_CANDIDATES = (
+    "light_hue",
+    "hue",
+    "colour_hue",
+    "color_hue",
+    "hsv_hue",
+)
 _SATURATION_PROPERTY_CANDIDATES = (
     "light_saturation",
     "saturation",
     "colour_saturation",
     "color_saturation",
+    "hsv_saturation",
 )
 _COLOR_TEMP_PROPERTY_CANDIDATES = (
     "color_temp",
@@ -135,6 +142,18 @@ class NomaIQLightEntity(LightEntity):
         self._pending_updates: dict[str, int | float] = {}
         self._pending_lock = asyncio.Lock()
         self._flush_task: asyncio.Task[None] | None = None
+        _LOGGER.warning(
+            (
+                "NomaIQ light %s property mapping: power=%s brightness=%s hue=%s "
+                "saturation=%s color_temp=%s"
+            ),
+            self._device.serial_number,
+            self._power_property,
+            self._brightness_property,
+            self._hue_property,
+            self._saturation_property,
+            self._color_temp_property,
+        )
 
         if self._color_temp_property:
             prop_min = self._property_min_value(self._color_temp_property, 153)
@@ -257,6 +276,16 @@ class NomaIQLightEntity(LightEntity):
                 return candidate_name
 
         return None
+
+    def _resolve_write_property_api_name(
+        self, property_name: str, prop: Mapping[str, Any]
+    ) -> str | None:
+        """Resolve the best API property name for writes."""
+        set_alias = self._find_set_property_api_name(property_name)
+        if set_alias:
+            return set_alias
+        api_property_name = prop.get("name")
+        return str(api_property_name) if api_property_name else None
 
     @staticmethod
     def _coerce_is_on(value: Any) -> bool:
@@ -451,9 +480,9 @@ class NomaIQLightEntity(LightEntity):
         prop = self._property_definition(property_name, use_current_device=False)
         if not prop:
             return False
-        if not bool(prop.get("read_only")):
+        if self._find_set_property_api_name(property_name):
             return True
-        return self._find_set_property_api_name(property_name) is not None
+        return not bool(prop.get("read_only"))
 
     def _update_cached_property_value(self, property_name: str, value: int | float) -> None:
         """Update local and coordinator-cached property values optimistically."""
@@ -475,12 +504,10 @@ class NomaIQLightEntity(LightEntity):
         if not prop:
             _LOGGER.debug("Skipping unsupported property write: %s", property_name)
             return False
-        api_property_name = prop.get("name")
-        if prop.get("read_only"):
-            api_property_name = self._find_set_property_api_name(property_name)
-            if not api_property_name:
-                _LOGGER.debug("Skipping read-only property write: %s", property_name)
-                return False
+        api_property_name = self._resolve_write_property_api_name(property_name, prop)
+        if prop.get("read_only") and not self._find_set_property_api_name(property_name):
+            _LOGGER.debug("Skipping read-only property write: %s", property_name)
+            return False
         if not api_property_name:
             _LOGGER.debug("Skipping property write without API name: %s", property_name)
             return False
@@ -608,6 +635,11 @@ class NomaIQLightEntity(LightEntity):
                 )
             )
             self._attr_color_mode = ColorMode.HS
+        elif ATTR_HS_COLOR in kwargs:
+            _LOGGER.warning(
+                "Ignoring HS color update for %s: hue/saturation properties not available",
+                self._device.serial_number,
+            )
 
         if self._color_temp_property and ATTR_COLOR_TEMP_KELVIN in kwargs:
             updates[self._color_temp_property] = self._color_temp_kelvin_to_device(
