@@ -1,4 +1,3 @@
-"""Platform for light integration."""
 
 from __future__ import annotations
 
@@ -13,9 +12,11 @@ import ayla_iot_unofficial.device
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -29,6 +30,11 @@ from .coordinator import NomaIQDataUpdateCoordinator
 _LOGGER = logging.getLogger(__name__)
 _DEBOUNCE_SECONDS = 0.25
 _INTER_PROPERTY_DELAY_SECONDS = 0.05
+_DISCRETE_COLOR_TEMP_MAX_STEPS = 8
+_DISCRETE_COLOR_TEMP_PRESET_NAMES = {
+    5: ("Candlelight", "Warm White", "White", "Cool White", "Daylight"),
+    3: ("Warm White", "White", "Daylight"),
+}
 
 _POWER_PROPERTY_CANDIDATES = ("light_control", "light_switch", "power_switch", "power")
 _BRIGHTNESS_PROPERTY_CANDIDATES = ("light_brightness", "brightness")
@@ -51,6 +57,13 @@ _COLOR_TEMP_PROPERTY_CANDIDATES = (
     "light_color_temp",
     "colour_temp",
     "light_colour_temp",
+    "cct",
+    "light_cct",
+    "white_value",
+    "white_color_temp",
+    "correlated_color_temperature",
+    "warm_white",
+    "cool_white",
 )
 
 
@@ -99,7 +112,7 @@ async def async_setup_entry(
 
 
 class NomaIQLightEntity(LightEntity):
-    """Representation of a NomaIQ Light."""
+    """Representation of a NomaIQ light."""
 
     def __init__(
         self,
@@ -135,7 +148,17 @@ class NomaIQLightEntity(LightEntity):
         )
         self._color_temp_property = self._find_property(
             _COLOR_TEMP_PROPERTY_CANDIDATES,
-            fallback_terms=("color_temp", "colour_temp", "temperature", "kelvin", "mired"),
+            fallback_terms=(
+                "color_temp",
+                "colour_temp",
+                "temperature",
+                "kelvin",
+                "mired",
+                "cct",
+                "white",
+                "warm",
+                "cool",
+            ),
         )
         self._color_temp_uses_mired = self._detect_color_temp_mired_mode()
         self._set_supported_color_modes()
@@ -155,7 +178,7 @@ class NomaIQLightEntity(LightEntity):
             self._color_temp_property,
         )
 
-        if self._color_temp_property:
+        if self._color_temp_property and not self._color_temp_is_discrete():
             prop_min = self._property_min_value(self._color_temp_property, 153)
             prop_max = self._property_max_value(self._color_temp_property, 500)
             if self._color_temp_uses_mired:
@@ -173,15 +196,19 @@ class NomaIQLightEntity(LightEntity):
 
     def _set_supported_color_modes(self) -> None:
         supported_modes: set[ColorMode] = set()
+        self._attr_supported_features = LightEntityFeature(0)
         if self._hue_property and self._saturation_property:
             supported_modes.add(ColorMode.HS)
-        if self._color_temp_property:
+        if self._color_temp_property and not self._color_temp_is_discrete():
             supported_modes.add(ColorMode.COLOR_TEMP)
         if not supported_modes and self._brightness_property:
             supported_modes.add(ColorMode.BRIGHTNESS)
         if not supported_modes:
             supported_modes.add(ColorMode.ONOFF)
         self._attr_supported_color_modes = supported_modes
+        if self._color_temp_property and self._color_temp_is_discrete():
+            self._attr_supported_features |= LightEntityFeature.EFFECT
+            self._attr_effect_list = self._discrete_preset_names()
         if ColorMode.HS in supported_modes:
             self._attr_color_mode = ColorMode.HS
         elif ColorMode.COLOR_TEMP in supported_modes:
@@ -350,12 +377,67 @@ class NomaIQLightEntity(LightEntity):
         return default
 
     def _detect_color_temp_mired_mode(self) -> bool:
-        """Detect whether color temp values are exposed as mireds."""
-        if not self._color_temp_property:
+        """Detect whether color temp values are exposed as mireds.
+
+        Only meaningful when the property is a continuous range; discrete
+        preset-index properties are handled separately via ``effect``.
+        """
+        if not self._color_temp_property or self._color_temp_is_discrete():
             return False
         prop_min = self._property_min_value(self._color_temp_property, 153)
         prop_max = self._property_max_value(self._color_temp_property, 500)
         return max(prop_min, prop_max) <= 1000
+
+    def _color_temp_is_discrete(self) -> bool:
+        """Return True if the color-temp-like property is a small preset index.
+
+        Many OEM Ayla-based "tunable white" bulbs (e.g. NOMA iQ) don't expose
+        a continuous Kelvin/mired range at all -- their app only shows a
+        handful of fixed preset buttons (Candlelight/White/Daylight-style).
+        The underlying property in that case is a small integer index (often
+        1-5), not a real color temperature. Treating it as continuous causes
+        every HA slider position to collapse to the same clamped edge value,
+        which looks exactly like "color changes are not applied". We detect
+        this by checking whether the property's value span is small enough
+        to be an index rather than a real Kelvin/mired range.
+        """
+        if not self._color_temp_property:
+            return False
+        prop_min = self._property_min_value(self._color_temp_property, 0)
+        prop_max = self._property_max_value(self._color_temp_property, 0)
+        span = abs(prop_max - prop_min)
+        return 0 < span <= _DISCRETE_COLOR_TEMP_MAX_STEPS
+
+    def _discrete_preset_values(self) -> list[int]:
+        """Return the sorted list of raw integer values for discrete presets."""
+        prop_min = int(round(self._property_min_value(self._color_temp_property, 1)))
+        prop_max = int(round(self._property_max_value(self._color_temp_property, 5)))
+        low, high = min(prop_min, prop_max), max(prop_min, prop_max)
+        return list(range(low, high + 1))
+
+    def _discrete_preset_names(self) -> list[str]:
+        """Return human-friendly names for each discrete preset value."""
+        values = self._discrete_preset_values()
+        names = _DISCRETE_COLOR_TEMP_PRESET_NAMES.get(len(values))
+        if names:
+            return list(names)
+        return [f"Preset {i + 1}" for i in range(len(values))]
+
+    def _preset_value_to_name(self, value: int) -> str | None:
+        values = self._discrete_preset_values()
+        names = self._discrete_preset_names()
+        try:
+            return names[values.index(int(value))]
+        except (ValueError, IndexError):
+            return None
+
+    def _preset_name_to_value(self, name: str) -> int | None:
+        values = self._discrete_preset_values()
+        names = self._discrete_preset_names()
+        try:
+            return values[names.index(name)]
+        except (ValueError, IndexError):
+            return None
 
     def _ha_brightness_to_device(self, brightness: int) -> int:
         """Convert HA brightness [0..255] to the device brightness range."""
@@ -461,7 +543,7 @@ class NomaIQLightEntity(LightEntity):
     @property
     def color_temp_kelvin(self) -> int | None:
         """Return color temperature in kelvin."""
-        if not self._color_temp_property:
+        if not self._color_temp_property or self._color_temp_is_discrete():
             return None
         value = self._safe_get_property_value(self._color_temp_property)
         if value is None:
@@ -475,14 +557,36 @@ class NomaIQLightEntity(LightEntity):
             )
         )
 
+    @property
+    def effect(self) -> str | None:
+        """Return the current discrete white-temperature preset, if applicable."""
+        if not self._color_temp_property or not self._color_temp_is_discrete():
+            return None
+        value = self._safe_get_property_value(self._color_temp_property)
+        if value is None:
+            return None
+        try:
+            return self._preset_value_to_name(int(value))
+        except (TypeError, ValueError):
+            return None
+
     def _property_is_writable(self, property_name: str) -> bool:
-        """Check whether a property is known and writable."""
+        """Check whether a property is known and writable.
+
+        Ayla device schemas vary between models: some expose a distinct
+        ``SET_*``-prefixed input property, others reuse the same property
+        name for both read and write, and the ``read_only`` flag on the
+        read/output property is not a reliable signal for whether the
+        underlying feature is actually controllable. Pre-emptively blocking
+        writes based on that flag caused color/color-temperature updates to
+        be silently dropped on bulbs that expose those flags this way (while
+        on/off and brightness happened to be marked writable and worked
+        fine). We now only refuse to write when the property is entirely
+        unknown; genuine write rejections are surfaced via the API error
+        instead of guessed at client-side.
+        """
         prop = self._property_definition(property_name, use_current_device=False)
-        if not prop:
-            return False
-        if self._find_set_property_api_name(property_name):
-            return True
-        return not bool(prop.get("read_only"))
+        return prop is not None
 
     def _update_cached_property_value(self, property_name: str, value: int | float) -> None:
         """Update local and coordinator-cached property values optimistically."""
@@ -505,11 +609,13 @@ class NomaIQLightEntity(LightEntity):
             _LOGGER.debug("Skipping unsupported property write: %s", property_name)
             return False
         api_property_name = self._resolve_write_property_api_name(property_name, prop)
-        if prop.get("read_only") and not self._find_set_property_api_name(property_name):
-            _LOGGER.debug("Skipping read-only property write: %s", property_name)
-            return False
         if not api_property_name:
-            _LOGGER.debug("Skipping property write without API name: %s", property_name)
+            _LOGGER.warning(
+                "Skipping property write for %s: no API property name could be resolved "
+                "(known keys: %s)",
+                property_name,
+                sorted(getattr(self._device, "properties_full", {}) or {}),
+            )
             return False
 
         endpoint = self._device.set_property_endpoint(api_property_name)
@@ -641,12 +747,32 @@ class NomaIQLightEntity(LightEntity):
                 self._device.serial_number,
             )
 
-        if self._color_temp_property and ATTR_COLOR_TEMP_KELVIN in kwargs:
+        if (
+            self._color_temp_property
+            and not self._color_temp_is_discrete()
+            and ATTR_COLOR_TEMP_KELVIN in kwargs
+        ):
             updates[self._color_temp_property] = self._color_temp_kelvin_to_device(
                 int(kwargs[ATTR_COLOR_TEMP_KELVIN])
             )
             if ColorMode.HS not in self.supported_color_modes or ATTR_HS_COLOR not in kwargs:
                 self._attr_color_mode = ColorMode.COLOR_TEMP
+
+        if (
+            self._color_temp_property
+            and self._color_temp_is_discrete()
+            and ATTR_EFFECT in kwargs
+        ):
+            preset_value = self._preset_name_to_value(kwargs[ATTR_EFFECT])
+            if preset_value is None:
+                _LOGGER.warning(
+                    "Unknown white-temperature preset %r for %s (available: %s)",
+                    kwargs[ATTR_EFFECT],
+                    self._device.serial_number,
+                    self._discrete_preset_names(),
+                )
+            else:
+                updates[self._color_temp_property] = preset_value
 
         await self._queue_updates(updates)
 
@@ -656,4 +782,4 @@ class NomaIQLightEntity(LightEntity):
 
     async def async_update(self) -> None:
         """Update the light state."""
-        await self.coordinator.async_request_refresh()
+
