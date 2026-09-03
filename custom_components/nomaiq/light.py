@@ -11,6 +11,7 @@ import ayla_iot_unofficial.device
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
+    ATTR_COLOR_TEMP,
     ATTR_COLOR_TEMP_KELVIN,
     ATTR_EFFECT,
     ATTR_HS_COLOR,
@@ -177,6 +178,7 @@ class NomaIQLightEntity(LightEntity):
             self._saturation_property,
             self._color_temp_property,
         )
+        self._log_mapped_property_details()
 
         if self._color_temp_property and not self._color_temp_is_discrete():
             prop_min = self._property_min_value(self._color_temp_property, 153)
@@ -248,6 +250,39 @@ class NomaIQLightEntity(LightEntity):
                 if any(term in normalized_name for term in fallback_terms):
                     return property_name
         return None
+
+    def _property_log_details(self, property_name: str | None) -> str:
+        """Return compact details for a mapped property for diagnostics."""
+        if not property_name:
+            return "none"
+        prop = self._property_definition(property_name, use_current_device=False)
+        if not prop:
+            return f"{property_name} (unavailable)"
+        api_name = prop.get("name")
+        base_type = prop.get("base_type")
+        read_only = prop.get("read_only")
+        current_value = prop.get("value")
+        raw_min = prop.get("min", prop.get("minimum", prop.get("lower")))
+        raw_max = prop.get("max", prop.get("maximum", prop.get("upper")))
+        return (
+            f"{property_name}(api={api_name},type={base_type},ro={read_only},"
+            f"value={current_value},min={raw_min},max={raw_max})"
+        )
+
+    def _log_mapped_property_details(self) -> None:
+        """Log concrete mapped-property metadata for troubleshooting."""
+        _LOGGER.warning(
+            (
+                "NomaIQ light %s mapped details: power=%s brightness=%s hue=%s "
+                "saturation=%s color_temp=%s"
+            ),
+            self._device.serial_number,
+            self._property_log_details(self._power_property),
+            self._property_log_details(self._brightness_property),
+            self._property_log_details(self._hue_property),
+            self._property_log_details(self._saturation_property),
+            self._property_log_details(self._color_temp_property),
+        )
 
     def _property_definition(
         self,
@@ -359,10 +394,15 @@ class NomaIQLightEntity(LightEntity):
         prop = self._property_definition(property_name, use_current_device=False)
         if not prop:
             return default
-        for key in ("min", "minimum"):
+        for key in ("min", "minimum", "lower", "min_value"):
             raw_value = prop.get(key)
             if isinstance(raw_value, (int, float)):
                 return float(raw_value)
+            if isinstance(raw_value, str):
+                try:
+                    return float(raw_value)
+                except ValueError:
+                    continue
         return default
 
     def _property_max_value(self, property_name: str, default: float) -> float:
@@ -370,10 +410,15 @@ class NomaIQLightEntity(LightEntity):
         prop = self._property_definition(property_name, use_current_device=False)
         if not prop:
             return default
-        for key in ("max", "maximum"):
+        for key in ("max", "maximum", "upper", "max_value"):
             raw_value = prop.get(key)
             if isinstance(raw_value, (int, float)):
                 return float(raw_value)
+            if isinstance(raw_value, str):
+                try:
+                    return float(raw_value)
+                except ValueError:
+                    continue
         return default
 
     def _detect_color_temp_mired_mode(self) -> bool:
@@ -406,7 +451,27 @@ class NomaIQLightEntity(LightEntity):
         prop_min = self._property_min_value(self._color_temp_property, 0)
         prop_max = self._property_max_value(self._color_temp_property, 0)
         span = abs(prop_max - prop_min)
-        return 0 < span <= _DISCRETE_COLOR_TEMP_MAX_STEPS
+        if 0 < span <= _DISCRETE_COLOR_TEMP_MAX_STEPS:
+            return True
+
+        # Some models do not expose min/max. Infer a preset index from small
+        # integer-like values commonly used by tunable-white presets.
+        if span == 0:
+            current_value = self._safe_get_property_value(self._color_temp_property)
+            if isinstance(current_value, bool):
+                return False
+            if isinstance(current_value, (int, float)):
+                numeric = float(current_value)
+            elif isinstance(current_value, str):
+                try:
+                    numeric = float(current_value)
+                except ValueError:
+                    return False
+            else:
+                return False
+            if numeric.is_integer() and 0 <= numeric <= _DISCRETE_COLOR_TEMP_MAX_STEPS + 1:
+                return True
+        return False
 
     def _discrete_preset_values(self) -> list[int]:
         """Return the sorted list of raw integer values for discrete presets."""
@@ -750,10 +815,16 @@ class NomaIQLightEntity(LightEntity):
         if (
             self._color_temp_property
             and not self._color_temp_is_discrete()
-            and ATTR_COLOR_TEMP_KELVIN in kwargs
+            and (ATTR_COLOR_TEMP_KELVIN in kwargs or ATTR_COLOR_TEMP in kwargs)
         ):
+            kelvin = None
+            if ATTR_COLOR_TEMP_KELVIN in kwargs:
+                kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+            else:
+                # Legacy HA color temp attribute in mireds.
+                kelvin = color_util.color_temperature_mired_to_kelvin(int(kwargs[ATTR_COLOR_TEMP]))
             updates[self._color_temp_property] = self._color_temp_kelvin_to_device(
-                int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+                kelvin
             )
             if ColorMode.HS not in self.supported_color_modes or ATTR_HS_COLOR not in kwargs:
                 self._attr_color_mode = ColorMode.COLOR_TEMP
@@ -761,18 +832,35 @@ class NomaIQLightEntity(LightEntity):
         if (
             self._color_temp_property
             and self._color_temp_is_discrete()
-            and ATTR_EFFECT in kwargs
+            and (
+                ATTR_EFFECT in kwargs
+                or ATTR_COLOR_TEMP_KELVIN in kwargs
+                or ATTR_COLOR_TEMP in kwargs
+            )
         ):
-            preset_value = self._preset_name_to_value(kwargs[ATTR_EFFECT])
-            if preset_value is None:
-                _LOGGER.warning(
-                    "Unknown white-temperature preset %r for %s (available: %s)",
-                    kwargs[ATTR_EFFECT],
-                    self._device.serial_number,
-                    self._discrete_preset_names(),
-                )
+            if ATTR_EFFECT in kwargs:
+                preset_value = self._preset_name_to_value(kwargs[ATTR_EFFECT])
+                if preset_value is None:
+                    _LOGGER.warning(
+                        "Unknown white-temperature preset %r for %s (available: %s)",
+                        kwargs[ATTR_EFFECT],
+                        self._device.serial_number,
+                        self._discrete_preset_names(),
+                    )
+                else:
+                    updates[self._color_temp_property] = preset_value
             else:
-                updates[self._color_temp_property] = preset_value
+                if ATTR_COLOR_TEMP_KELVIN in kwargs:
+                    kelvin = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+                else:
+                    kelvin = color_util.color_temperature_mired_to_kelvin(
+                        int(kwargs[ATTR_COLOR_TEMP])
+                    )
+                values = self._discrete_preset_values()
+                if values:
+                    target = self._color_temp_kelvin_to_device(kelvin)
+                    nearest = min(values, key=lambda value: abs(value - target))
+                    updates[self._color_temp_property] = nearest
 
         await self._queue_updates(updates)
 
@@ -782,4 +870,4 @@ class NomaIQLightEntity(LightEntity):
 
     async def async_update(self) -> None:
         """Update the light state."""
-
+        await self.coordinator.async_request_refresh()

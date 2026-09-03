@@ -1,2 +1,2 @@
 homeassistant
-ayla-iot-unofficial==1.5.0
+ayla-iot-unofficial==1.5.2
